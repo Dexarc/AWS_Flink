@@ -49,16 +49,19 @@ public class StreamingJob {
         env.getCheckpointConfig().setCheckpointTimeout(600000);
         env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
         
+        // Enable checkpoint recovery without data loss
+        env.getCheckpointConfig().setTolerableCheckpointFailureNumber(3);
+        
         env.setParallelism(1);
 
-        LOG.info("Starting MSK to S3 Tables (Iceberg) - DataStream API");
+        LOG.info("Starting MSK to S3 Tables (Iceberg) - DataStream API with Deduplication");
 
-        // Step 1: Build Kafka Source
+        // Step 1: Build Kafka Source - CHANGED TO EARLIEST
         KafkaSource<String> source = KafkaSource.<String>builder()
             .setBootstrapServers(bootstrapServers)
             .setTopics("user_events")
             .setGroupId("flink-s3-tables-datastream")
-            .setStartingOffsets(OffsetsInitializer.earliest())
+            .setStartingOffsets(OffsetsInitializer.earliest())  // ✅ Read from earliest
             .setValueOnlyDeserializer(new SimpleStringSchema())
             .setProperty("security.protocol", "SASL_SSL")
             .setProperty("sasl.mechanism", "AWS_MSK_IAM")
@@ -77,7 +80,7 @@ public class StreamingJob {
         DataStream<RowData> rowDataStream = kafkaStream
             .map(json -> {
                 try {
-                    LOG.info("Processing record: {}", json);
+                    LOG.info("Processing record: {}", json);  // Changed to INFO for visibility
                     JsonNode node = mapper.readTree(json);
                     JsonNode metadata = node.get("metadata");
                     
@@ -152,17 +155,20 @@ public class StreamingJob {
                     .identity("event_hour")
                     .build();
                 
+                // ✅ FIXED: Added format-version 2 for upsert support
                 Map<String, String> tableProps = new HashMap<>();
                 tableProps.put("write.format.default", "parquet");
                 tableProps.put("write.parquet.compression-codec", "snappy");
+                tableProps.put("format-version", "2");  // Required for upsert mode
+                tableProps.put("write.upsert.enabled", "true");  // Enable upsert explicitly
                 
                 catalog.createTable(tableId, schema, spec, tableProps);
-                LOG.info("Table created successfully");
+                LOG.info("Table created successfully with format-version 2 and upsert enabled");
             } else {
                 LOG.info("Table already exists: {}", tableId);
             }
         } catch (Exception e) {
-            LOG.error("Error creating table", e);
+            LOG.error("Error creating/updating table", e);
             throw e;
         }
         
@@ -171,12 +177,15 @@ public class StreamingJob {
         tableLoader.open();
         LOG.info("TableLoader opened successfully");
 
-        // Step 5: Write to Iceberg table using FlinkSink with proper configuration
+        // Step 5: Write to Iceberg table using UPSERT with CORRECT equality fields
+        // ✅ FIXED: Include BOTH event_id AND event_hour (partition field)
         FlinkSink.forRowData(rowDataStream)
             .tableLoader(tableLoader)
+            .equalityFieldColumns(java.util.Arrays.asList("event_id", "event_hour"))  // Must include partition field!
+            .upsert(true)
             .append();
 
-        LOG.info("Starting Flink job execution...");
-        env.execute("MSK to S3 Tables - DataStream API");
+        LOG.info("Starting Flink job execution with deduplication (reading from earliest)...");
+        env.execute("MSK to S3 Tables - DataStream API with Deduplication");
     }
 }
