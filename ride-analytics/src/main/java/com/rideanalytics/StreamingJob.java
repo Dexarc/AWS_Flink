@@ -1,94 +1,182 @@
 package com.amazonaws.services.msf;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.StringData;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.flink.CatalogLoader;
+import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.sink.FlinkSink;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.Map;
 
 public class StreamingJob {
     
     private static final Logger LOG = LoggerFactory.getLogger(StreamingJob.class);
+    private static final ObjectMapper mapper = new ObjectMapper();
+    private static final DateTimeFormatter hourFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd-HH")
+            .withZone(ZoneId.systemDefault());
 
     public static void main(String[] args) throws Exception {
         
-        // Create Flink execution environment
+        String bootstrapServers = "b-1.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098," +
+                                  "b-2.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098," +
+                                  "b-3.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098";
+        
+        // Setup Flink with proper checkpointing
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         
-        // Set parallelism to 1 for debugging (increase later for production)
+        // CRITICAL: Configure checkpointing properly for Iceberg
+        env.enableCheckpointing(60000, CheckpointingMode.EXACTLY_ONCE);
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30000);
+        env.getCheckpointConfig().setCheckpointTimeout(600000);
+        env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+        
         env.setParallelism(1);
-        
-        // Enable checkpointing for fault tolerance
-        env.enableCheckpointing(60000); // checkpoint every 60 seconds
 
-        // Generate unique consumer group to avoid offset issues
-        String consumerGroup = "flink-consumer-" + System.currentTimeMillis();
-        
-        LOG.info("Starting Flink job with consumer group: {}", consumerGroup);
+        LOG.info("Starting MSK to S3 Tables (Iceberg) - DataStream API");
 
-        // Build KafkaSource with IAM authentication
+        // Step 1: Build Kafka Source
         KafkaSource<String> source = KafkaSource.<String>builder()
-            .setBootstrapServers(
-                "b-1.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098," +
-                "b-2.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098," +
-                "b-3.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098")
+            .setBootstrapServers(bootstrapServers)
             .setTopics("user_events")
-            .setGroupId(consumerGroup)
-            // Use LATEST to read only NEW messages (change to earliest() to read all)
+            .setGroupId("flink-s3-tables-datastream")
             .setStartingOffsets(OffsetsInitializer.earliest())
             .setValueOnlyDeserializer(new SimpleStringSchema())
-            
-            // IAM Authentication properties
             .setProperty("security.protocol", "SASL_SSL")
             .setProperty("sasl.mechanism", "AWS_MSK_IAM")
             .setProperty("sasl.jaas.config", "software.amazon.msk.auth.iam.IAMLoginModule required;")
             .setProperty("sasl.client.callback.handler.class", 
                 "software.amazon.msk.auth.iam.IAMClientCallbackHandler")
-            
-            // Connection and timeout properties
-            .setProperty("request.timeout.ms", "60000")
-            .setProperty("session.timeout.ms", "30000")
-            .setProperty("heartbeat.interval.ms", "3000")
-            
-            // Partition discovery for dynamic partition addition
-            .setProperty("partition.discovery.interval.ms", "10000")
-            
-            // Disable auto-commit (Flink handles this)
-            .setProperty("enable.auto.commit", "false")
-            
-            // Increase fetch size for better throughput
-            .setProperty("fetch.min.bytes", "1")
-            .setProperty("fetch.max.wait.ms", "500")
-            
             .build();
 
-        // Create data stream from Kafka
-        DataStream<String> stream = env.fromSource(
+        DataStream<String> kafkaStream = env.fromSource(
             source, 
             WatermarkStrategy.noWatermarks(), 
             "Kafka Source"
         );
 
-        // CRITICAL FIX: Use uid() and name() on map operator, then disable chaining
-        // This breaks operator chaining and makes metrics visible in the Flink UI
-        stream
-            .map(msg -> {
-                LOG.info("=== RECEIVED MESSAGE FROM KAFKA ===");
-                LOG.info("Message: {}", msg);
-                System.err.println(">>> KAFKA MESSAGE: " + msg);
-                return "Processed: " + msg;
+        // Step 2: Transform JSON to Flink RowData (flattening metadata)
+        DataStream<RowData> rowDataStream = kafkaStream
+            .map(json -> {
+                try {
+                    LOG.info("Processing record: {}", json);
+                    JsonNode node = mapper.readTree(json);
+                    JsonNode metadata = node.get("metadata");
+                    
+                    // Create RowData with 10 fields matching Iceberg schema order
+                    GenericRowData row = new GenericRowData(10);
+                    
+                    // Fields MUST match the order defined in Iceberg schema (field IDs 1-10)
+                    row.setField(0, StringData.fromString(node.get("event_id").asText()));
+                    row.setField(1, StringData.fromString(node.get("user_id").asText()));
+                    row.setField(2, StringData.fromString(node.get("event_type").asText()));
+                    row.setField(3, node.get("timestamp").asLong());
+                    row.setField(4, StringData.fromString(node.get("ride_id").asText()));
+                    row.setField(5, metadata.get("surge_multiplier").asDouble());
+                    row.setField(6, metadata.get("estimated_wait_minutes").asInt());
+                    row.setField(7, metadata.get("fare_amount").asDouble());
+                    row.setField(8, metadata.get("driver_rating").asDouble());
+                    
+                    // Add hourly partition from timestamp
+                    long timestamp = node.get("timestamp").asLong();
+                    String eventHour = hourFormatter.format(Instant.ofEpochMilli(timestamp));
+                    row.setField(9, StringData.fromString(eventHour));
+                    
+                    LOG.info("Created row with event_id: {}, event_hour: {}", 
+                        node.get("event_id").asText(), eventHour);
+                    
+                    return (RowData) row;
+                } catch (Exception e) {
+                    LOG.error("Failed to parse: {}", json, e);
+                    return null;
+                }
             })
-            .name("Process Kafka Message")
-            .uid("process-kafka-msg")
-            .disableChaining()  // Disable chaining HERE (on the SingleOutputStreamOperator)
-            .print()
-            .name("Print to Output");
+            .filter(row -> row != null)
+            .name("Parse and Transform");
 
-        // Execute the job
-        LOG.info("Executing Flink job - waiting for messages from user_events topic...");
-        env.execute("MSK to Flink POC Job");
+        // Step 3: Create S3 Tables Catalog Loader
+        Map<String, String> catalogProps = new HashMap<>();
+        catalogProps.put(CatalogProperties.CATALOG_IMPL, "software.amazon.s3tables.iceberg.S3TablesCatalog");
+        catalogProps.put(CatalogProperties.WAREHOUSE_LOCATION, 
+                "arn:aws:s3tables:ap-south-1:149815625933:bucket/flink-transform-sink");
+        
+        CatalogLoader catalogLoader = CatalogLoader.custom(
+            "s3_tables",
+            catalogProps,
+            new Configuration(),
+            "software.amazon.s3tables.iceberg.S3TablesCatalog"
+        );
+
+        // Step 4: Create table if it doesn't exist
+        TableIdentifier tableId = TableIdentifier.of("sink", "ride_events");
+        
+        try {
+            org.apache.iceberg.catalog.Catalog catalog = catalogLoader.loadCatalog();
+            
+            // Check if table exists, if not create it
+            if (!catalog.tableExists(tableId)) {
+                LOG.info("Table does not exist, creating: {}", tableId);
+                
+                org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
+                    org.apache.iceberg.types.Types.NestedField.required(1, "event_id", org.apache.iceberg.types.Types.StringType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(2, "user_id", org.apache.iceberg.types.Types.StringType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(3, "event_type", org.apache.iceberg.types.Types.StringType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(4, "event_timestamp", org.apache.iceberg.types.Types.LongType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(5, "ride_id", org.apache.iceberg.types.Types.StringType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(6, "surge_multiplier", org.apache.iceberg.types.Types.DoubleType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(7, "estimated_wait_minutes", org.apache.iceberg.types.Types.IntegerType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(8, "fare_amount", org.apache.iceberg.types.Types.DoubleType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(9, "driver_rating", org.apache.iceberg.types.Types.DoubleType.get()),
+                    org.apache.iceberg.types.Types.NestedField.required(10, "event_hour", org.apache.iceberg.types.Types.StringType.get())
+                );
+                
+                org.apache.iceberg.PartitionSpec spec = org.apache.iceberg.PartitionSpec.builderFor(schema)
+                    .identity("event_hour")
+                    .build();
+                
+                Map<String, String> tableProps = new HashMap<>();
+                tableProps.put("write.format.default", "parquet");
+                tableProps.put("write.parquet.compression-codec", "snappy");
+                
+                catalog.createTable(tableId, schema, spec, tableProps);
+                LOG.info("Table created successfully");
+            } else {
+                LOG.info("Table already exists: {}", tableId);
+            }
+        } catch (Exception e) {
+            LOG.error("Error creating table", e);
+            throw e;
+        }
+        
+        // CRITICAL: Create and open the TableLoader
+        TableLoader tableLoader = TableLoader.fromCatalog(catalogLoader, tableId);
+        tableLoader.open();
+        LOG.info("TableLoader opened successfully");
+
+        // Step 5: Write to Iceberg table using FlinkSink with proper configuration
+        FlinkSink.forRowData(rowDataStream)
+            .tableLoader(tableLoader)
+            .append();
+
+        LOG.info("Starting Flink job execution...");
+        env.execute("MSK to S3 Tables - DataStream API");
     }
 }
