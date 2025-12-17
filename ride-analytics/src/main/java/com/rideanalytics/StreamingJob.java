@@ -53,7 +53,7 @@ public class StreamingJob {
         String startOffset = appProperties.getProperty("kafka.offset", "earliest"); // earliest or latest
         
         String s3Warehouse = appProperties.getProperty("s3.warehouse", 
-            "arn:aws:s3tables:ap-south-1:149815625933:bucket/flink-transform-sink-def"); //check to see runtime gets picked up instead
+            "arn:aws:s3tables:ap-south-1:149815625933:bucket/flink-transform-sink"); //check to see runtime gets picked up instead
         String tableName = appProperties.getProperty("table.name", "ride_events");
         String namespace = appProperties.getProperty("table.namespace", "sink");
         
