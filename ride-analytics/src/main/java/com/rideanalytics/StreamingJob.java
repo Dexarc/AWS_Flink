@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
-import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -40,7 +39,7 @@ public class StreamingJob {
 
     public static void main(String[] args) throws Exception {
         
-        // Load properties from KDA Runtime or fallback to command line args
+        // Load properties from KDA Runtime
         Properties appProperties = loadApplicationProperties(args);
         
         // Get parameters with defaults
@@ -48,23 +47,27 @@ public class StreamingJob {
             "b-1.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098," +
             "b-2.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098," +
             "b-3.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098");
-        String kafkaTopic = appProperties.getProperty("kafka.topic", "user_events");
+        
+        // Support comma-separated list of topics
+        String kafkaTopicsStr = appProperties.getProperty("kafka.topics", "user_events");
+        String[] kafkaTopics = kafkaTopicsStr.split(",");
+        
         String consumerGroup = appProperties.getProperty("kafka.consumer.group", "flink-s3-tables-datastream");
-        String startOffset = appProperties.getProperty("kafka.offset", "earliest"); // earliest or latest
+        String startOffset = appProperties.getProperty("kafka.offset", "earliest");
         
         String s3Warehouse = appProperties.getProperty("s3.warehouse", 
-            "arn:aws:s3tables:ap-south-1:149815625933:bucket/flink-transform-sink"); //check to see runtime gets picked up instead
-        String tableName = appProperties.getProperty("table.name", "ride_events");
+            "arn:aws:s3tables:ap-south-1:149815625933:bucket/flink-transform-sink");
         String namespace = appProperties.getProperty("table.namespace", "sink");
         
         int parallelism = Integer.parseInt(appProperties.getProperty("parallelism", "1"));
         long checkpointInterval = Long.parseLong(appProperties.getProperty("checkpoint.interval", "60000"));
         
         LOG.info("=== Configuration ===");
-        LOG.info("Kafka Topic: {}", kafkaTopic);
+        LOG.info("Kafka Topics: {}", kafkaTopicsStr);
         LOG.info("Consumer Group: {}", consumerGroup);
         LOG.info("Starting Offset: {}", startOffset);
-        LOG.info("Table: {}.{}", namespace, tableName);
+        LOG.info("Namespace: {}", namespace);
+        LOG.info("S3 Warehouse: {}", s3Warehouse);
         LOG.info("Parallelism: {}", parallelism);
         LOG.info("=====================");
         
@@ -77,9 +80,59 @@ public class StreamingJob {
         env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
         env.getCheckpointConfig().setTolerableCheckpointFailureNumber(3);
 
-        LOG.info("Starting MSK to S3 Tables (Iceberg) - DataStream API");
+        LOG.info("Starting MSK to S3 Tables (Iceberg) - Multi-Topic DataStream API");
 
-        // Kafka Source
+        // S3 Tables Catalog (shared across all topics)
+        Map<String, String> catalogProps = new HashMap<>();
+        catalogProps.put(CatalogProperties.CATALOG_IMPL, "software.amazon.s3tables.iceberg.S3TablesCatalog");
+        catalogProps.put(CatalogProperties.WAREHOUSE_LOCATION, s3Warehouse);
+        
+        CatalogLoader catalogLoader = CatalogLoader.custom(
+            "s3_tables",
+            catalogProps,
+            new Configuration(),
+            "software.amazon.s3tables.iceberg.S3TablesCatalog"
+        );
+
+        // Process each topic
+        for (String kafkaTopic : kafkaTopics) {
+            kafkaTopic = kafkaTopic.trim();
+            
+            // Generate table name from topic name
+            String tableName = kafkaTopic.replaceAll("[-.]", "_").toLowerCase();
+            
+            LOG.info("Processing topic: {} -> table: {}.{}", kafkaTopic, namespace, tableName);
+            
+            processTopicToTable(
+                env, 
+                bootstrapServers, 
+                kafkaTopic, 
+                consumerGroup, 
+                startOffset,
+                catalogLoader,
+                namespace,
+                tableName
+            );
+        }
+
+        env.execute("MSK to S3 Tables - Multi-Topic");
+    }
+    
+    /**
+     * Process a single Kafka topic and write to corresponding Iceberg table
+     */
+    private static void processTopicToTable(
+        StreamExecutionEnvironment env,
+        String bootstrapServers,
+        String kafkaTopic,
+        String consumerGroup,
+        String startOffset,
+        CatalogLoader catalogLoader,
+        String namespace,
+        String tableName
+    ) throws Exception {
+        
+        // Kafka Source for this topic
         OffsetsInitializer offsetInit = startOffset.equalsIgnoreCase("earliest") 
             ? OffsetsInitializer.earliest() 
             : OffsetsInitializer.latest();
@@ -100,7 +153,7 @@ public class StreamingJob {
         DataStream<String> kafkaStream = env.fromSource(
             source, 
             WatermarkStrategy.noWatermarks(), 
-            "Kafka Source"
+            "Kafka Source - " + kafkaTopic
         );
 
         // Transform
@@ -127,24 +180,12 @@ public class StreamingJob {
                     
                     return (RowData) row;
                 } catch (Exception e) {
-                    LOG.error("Failed to parse: {}", json, e);
+                    LOG.error("Failed to parse from topic {}: {}", kafkaTopic, json, e);
                     return null;
                 }
             })
             .filter(row -> row != null)
-            .name("Parse and Transform");
-
-        // S3 Tables Catalog
-        Map<String, String> catalogProps = new HashMap<>();
-        catalogProps.put(CatalogProperties.CATALOG_IMPL, "software.amazon.s3tables.iceberg.S3TablesCatalog");
-        catalogProps.put(CatalogProperties.WAREHOUSE_LOCATION, s3Warehouse);
-        
-        CatalogLoader catalogLoader = CatalogLoader.custom(
-            "s3_tables",
-            catalogProps,
-            new Configuration(),
-            "software.amazon.s3tables.iceberg.S3TablesCatalog"
-        );
+            .name("Parse and Transform - " + kafkaTopic);
 
         // Create table if needed
         TableIdentifier tableId = TableIdentifier.of(namespace, tableName);
@@ -179,12 +220,12 @@ public class StreamingJob {
                 tableProps.put("write.upsert.enabled", "true");
                 
                 catalog.createTable(tableId, schema, spec, tableProps);
-                LOG.info("Table created successfully");
+                LOG.info("Table created successfully: {}", tableId);
             } else {
                 LOG.info("Table already exists: {}", tableId);
             }
         } catch (Exception e) {
-            LOG.error("Error with table", e);
+            LOG.error("Error with table: {}", tableId, e);
             throw e;
         }
         
@@ -197,8 +238,8 @@ public class StreamingJob {
             .equalityFieldColumns(java.util.Arrays.asList("event_id", "event_hour"))
             .upsert(true)
             .append();
-
-        env.execute("MSK to S3 Tables");
+        
+        LOG.info("Sink configured for topic {} -> table {}", kafkaTopic, tableId);
     }
     
     /**
