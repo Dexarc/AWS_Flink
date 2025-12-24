@@ -1,0 +1,20 @@
+[
+  {
+    "PropertyGroupId": "KafkaSource0",
+    "PropertyMap": {
+      "bootstrap.servers": "b-1.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098,b-2.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098,b-3.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098",
+      "topic.name": "user_events",
+      "group.id": "flink-s3-tables-pyflink"
+    }
+  },
+  {
+    "PropertyGroupId": "S3TablesConfig0",
+    "PropertyMap": {
+      "catalog.name": "s3_tables",
+      "warehouse.arn": "arn:aws:s3tables:ap-south-1:149815625933:bucket/testing-poc-flink-table-bucket",
+      "database.name": "pocflink",
+      "table.name": "ride_events",
+      "aws.region": "ap-south-1"
+    }
+  }
+]
