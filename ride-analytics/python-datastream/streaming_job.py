@@ -6,7 +6,7 @@ import time
 sys.stdout = sys.stderr
 
 print("=" * 60)
-print("STARTING PYFLINK S3 TABLES STREAMING JOB")
+print("STARTING PYFLINK MSK -> S3 TABLES JOB")
 print("=" * 60)
 
 try:
@@ -19,16 +19,7 @@ try:
     print("PyFlink imports successful")
 
     # ------------------------------------------------------------
-    # EARLY CLASSLOADER HACK (intentional, documented)
-    #
-    # On AWS Managed Flink + PyFlink + Iceberg, the planner may try
-    # to resolve Iceberg/Hadoop classes before lib/*.jar is visible.
-    # We explicitly inject the shaded JAR to avoid ClassNotFoundException
-    # during CREATE CATALOG.
-    #
-    # IMPORTANT:
-    # - JAR must exist at lib/pyflink-dependencies.jar in the ZIP
-    # - Do NOT set pipeline.jars or pipeline.classpaths
+    # EARLY CLASSLOADER WORKAROUND
     # ------------------------------------------------------------
     gateway = get_gateway()
     jvm = gateway.jvm
@@ -53,18 +44,20 @@ try:
     print("TableEnvironment created (streaming mode)")
 
     # ------------------------------------------------------------
-    # Runtime configuration (KDA-safe)
+    # Runtime configuration
     # ------------------------------------------------------------
     config = table_env.get_config().get_configuration()
     config.set_string("table.exec.resource.default-parallelism", "1")
-    config.set_string("execution.checkpointing.interval", "30s")
+    config.set_string("execution.checkpointing.interval", "60s")
     config.set_string("execution.checkpointing.mode", "EXACTLY_ONCE")
 
     print("Pipeline configuration applied")
 
     # ------------------------------------------------------------
-    # S3 Tables / Iceberg configuration
+    # Configuration - UPDATE THESE VALUES
     # ------------------------------------------------------------
+    MSK_BOOTSTRAP_SERVERS = "b-3.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098,b-1.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098,b-2.workingmultitableclus.nhe1pt.c2.kafka.ap-south-1.amazonaws.com:9098"
+    KAFKA_TOPIC = "bid-events"
     S3_WAREHOUSE = "arn:aws:s3tables:ap-south-1:149815625933:bucket/python-saren"
     NAMESPACE = "sink"
 
@@ -88,67 +81,72 @@ try:
     print(f"Using Iceberg catalog s3_tables.{NAMESPACE}")
 
     # ------------------------------------------------------------
+    # Create Kafka source in default catalog
+    # ------------------------------------------------------------
+    table_env.use_catalog("default_catalog")
+    table_env.use_database("default_database")
+
+    print("Creating Kafka source table")
+
+    table_env.execute_sql(f"""
+        CREATE TABLE kafka_events (
+            event_payload STRING
+        ) WITH (
+            'connector' = 'kafka',
+            'topic' = '{KAFKA_TOPIC}',
+            'properties.bootstrap.servers' = '{MSK_BOOTSTRAP_SERVERS}',
+            'properties.group.id' = 'flink-s3tables-consumer',
+            'scan.startup.mode' = 'earliest-offset',
+            'value.format' = 'raw',
+            'properties.security.protocol' = 'SASL_SSL',
+            'properties.sasl.mechanism' = 'AWS_MSK_IAM',
+            'properties.sasl.jaas.config' = 'software.amazon.msk.auth.iam.IAMLoginModule required;',
+            'properties.sasl.client.callback.handler.class' = 'software.amazon.msk.auth.iam.IAMClientCallbackHandler'
+        )
+    """)
+
+    print("Kafka source table created")
+
+    # ------------------------------------------------------------
     # Create Iceberg sink table
     # ------------------------------------------------------------
+    table_env.use_catalog("s3_tables")
+    table_env.use_database(NAMESPACE)
+
+    print("Creating Iceberg sink table")
+
     table_env.execute_sql("""
-        CREATE TABLE IF NOT EXISTS test_events (
-            id STRING,
-            event_type STRING,
-            metric_value DOUBLE,
-            event_time BIGINT,
-            PRIMARY KEY (id) NOT ENFORCED
+        CREATE TABLE IF NOT EXISTS raw_events (
+            json_payload STRING,
+            ingestion_time TIMESTAMP(3)
         ) WITH (
             'format-version' = '2',
-            'write.format.default' = 'parquet'
+            'write.format.default' = 'parquet',
+            'write.parquet.compression-codec' = 'snappy'
         )
     """)
 
     print("Iceberg sink table created")
 
     # ------------------------------------------------------------
-    # Create datagen source in DEFAULT catalog
+    # Submit streaming INSERT
     # ------------------------------------------------------------
-    table_env.use_catalog("default_catalog")
-    table_env.use_database("default_database")
+    print("Submitting streaming INSERT job")
 
     table_env.execute_sql("""
-        CREATE TABLE datagen_source (
-            id STRING,
-            event_type STRING,
-            metric_value DOUBLE,
-            event_time BIGINT
-        ) WITH (
-            'connector' = 'datagen',
-            'rows-per-second' = '10',
-            'fields.id.length' = '10',
-            'fields.event_type.length' = '5',
-            'fields.metric_value.min' = '0',
-            'fields.metric_value.max' = '1000'
-        )
-    """)
-
-    print("Datagen source created in default_catalog")
-
-    # ------------------------------------------------------------
-    # Switch back to Iceberg catalog and submit streaming INSERT
-    # ------------------------------------------------------------
-    table_env.use_catalog("s3_tables")
-    table_env.use_database(NAMESPACE)
-
-    print("Submitting streaming INSERT")
-
-    table_env.execute_sql("""
-        INSERT INTO test_events
-        SELECT * FROM default_catalog.default_database.datagen_source
+        INSERT INTO raw_events
+        SELECT 
+            event_payload as json_payload,
+            CURRENT_TIMESTAMP as ingestion_time
+        FROM default_catalog.default_database.kafka_events
     """)
 
     print("Job submitted successfully")
+    print("Streaming MSK -> S3 Tables")
 
     # ------------------------------------------------------------
-    # Keep Python process alive (required on KDA)
+    # Keep Python process alive
     # ------------------------------------------------------------
-    print("Job running; keeping Python process alive")
-
     while True:
         time.sleep(60)
 

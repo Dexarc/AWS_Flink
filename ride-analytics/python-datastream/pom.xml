@@ -33,19 +33,37 @@
     </dependencyManagement>
 
     <dependencies>
+        <!-- Flink Kafka SQL connector -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-kafka</artifactId>
+            <version>3.3.0-1.19</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <version>3.6.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>software.amazon.msk</groupId>
+            <artifactId>aws-msk-iam-auth</artifactId>
+            <version>1.1.9</version>
+        </dependency>
 
         <!-- AWS S3 Tables SDK -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>s3tables</artifactId>
         </dependency>
-
         <!-- AWS S3 Tables Iceberg Catalog (DOC-CANONICAL) -->
         <dependency>
             <groupId>software.amazon.s3tables</groupId>
             <artifactId>s3-tables-catalog-for-iceberg</artifactId>
             <version>0.1.8</version>
         </dependency>
+
         <!-- Flink Core -->
         <dependency>
             <groupId>org.apache.flink</groupId>
@@ -53,6 +71,7 @@
             <version>${flink.version}</version>
             <scope>provided</scope>
         </dependency>
+        
         <!-- Iceberg runtime -->
         <dependency>
             <groupId>org.apache.iceberg</groupId>
@@ -112,7 +131,9 @@
 
                             <artifactSet>
                                 <excludes>
-                                    <exclude>org.apache.flink:*</exclude>
+                                    <exclude>org.apache.flink:flink-core</exclude>
+                                    <exclude>org.apache.flink:flink-streaming-java</exclude>
+                                    <exclude>org.apache.flink:flink-table-*</exclude>
                                     <exclude>org.slf4j:*</exclude>
                                     <exclude>commons-cli:commons-cli</exclude>
                                 </excludes>
